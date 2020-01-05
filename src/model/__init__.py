@@ -4,15 +4,15 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
-
+import copy
 from logging import getLogger
 import os
 import torch
 
+from src.model.elmo_embedder import ELMOTransEncoder
 from .pretrain import load_embeddings
 from .transformer import DECODER_ONLY_PARAMS, TransformerModel  # , TRANSFORMER_LAYER_PARAMS
 from .memory import HashingMemory
-
 
 logger = getLogger()
 
@@ -69,12 +69,17 @@ def check_model_params(params):
         params.mem_enc_positions = [(int(x[:-1]), 'after') if x[-1] == '+' else (int(x), 'in') for x in s_enc]
         params.mem_dec_positions = [(int(x[:-1]), 'after') if x[-1] == '+' else (int(x), 'in') for x in s_dec]
         assert len(params.mem_enc_positions) + len(params.mem_dec_positions) > 0
-        assert len(params.mem_enc_positions) == 0 or 0 <= min([x[0] for x in params.mem_enc_positions]) <= max([x[0] for x in params.mem_enc_positions]) <= params.n_layers - 1
-        assert len(params.mem_dec_positions) == 0 or 0 <= min([x[0] for x in params.mem_dec_positions]) <= max([x[0] for x in params.mem_dec_positions]) <= params.n_layers - 1
+        assert len(params.mem_enc_positions) == 0 or 0 <= min([x[0] for x in params.mem_enc_positions]) <= max(
+            [x[0] for x in params.mem_enc_positions]) <= params.n_layers - 1
+        assert len(params.mem_dec_positions) == 0 or 0 <= min([x[0] for x in params.mem_dec_positions]) <= max(
+            [x[0] for x in params.mem_dec_positions]) <= params.n_layers - 1
 
     # reload pretrained word embeddings
     if params.reload_emb != '':
         assert os.path.isfile(params.reload_emb)
+
+    if params.reload_emb_from_xml != '':
+        assert os.path.isfile(params.reload_emb_from_xml)
 
     # reload a pretrained model
     if params.reload_model != '':
@@ -119,7 +124,9 @@ def build_model(params, dico):
         # reload a pretrained model
         if params.reload_model != '':
             logger.info("Reloading model from %s ..." % params.reload_model)
-            reloaded = torch.load(params.reload_model, map_location=lambda storage, loc: storage.cuda(params.local_rank))['model']
+            reloaded = \
+                torch.load(params.reload_model, map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
             if all([k.startswith('module.') for k in reloaded.keys()]):
                 reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
 
@@ -134,13 +141,30 @@ def build_model(params, dico):
             model.load_state_dict(reloaded)
 
         logger.info("Model: {}".format(model))
-        logger.info("Number of parameters (model): %i" % sum([p.numel() for p in model.parameters() if p.requires_grad]))
+        logger.info(
+            "Number of parameters (model): %i" % sum([p.numel() for p in model.parameters() if p.requires_grad]))
 
         return model.cuda()
 
     else:
-        # build
-        encoder = TransformerModel(params, dico, is_encoder=True, with_output=True)  # TODO: only output when necessary - len(params.clm_steps + params.mlm_steps) > 0
+        # 使用language model的输出作为翻译模型的输入
+        if params.encoder_elmo_path != '':
+            # 在这里加载一个预训练好的模型
+            logger.info("Reloading encoder_elmo_path from %s ..." % params.encoder_elmo_path)
+            pretrain_model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+            reloaded = \
+                torch.load(params.encoder_elmo_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
+            if all([k.startswith('module.') for k in reloaded.keys()]):
+                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
+
+            pretrain_model.load_state_dict(reloaded)
+            params.language_model = pretrain_model
+            encoder = ELMOTransEncoder(params, dico, is_encoder=True, with_output=True)
+        else:
+            # build
+            encoder = TransformerModel(params, dico, is_encoder=True,
+                                       with_output=True)  # TODO: only output when necessary - len(params.clm_steps + params.mlm_steps) > 0
         decoder = TransformerModel(params, dico, is_encoder=False, with_output=True)
 
         # reload pretrained word embeddings
@@ -148,6 +172,57 @@ def build_model(params, dico):
             word2id, embeddings = load_embeddings(params.reload_emb, params)
             set_pretrain_emb(encoder, dico, word2id, embeddings)
             set_pretrain_emb(decoder, dico, word2id, embeddings)
+
+        # 使用xlm的embedding来初始化
+        if params.reload_emb_from_xml != '':
+            emb_path = params.reload_emb_from_xml
+
+            if emb_path != '':
+                logger.info("Reloading embedding from %s ..." % emb_path)
+                emb_reload = torch.load(emb_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
+                emb_reload = emb_reload['model' if 'model' in emb_reload else 'encoder']
+                emb_name = ['position_embeddings', 'lang_embeddings', 'embeddings']
+
+                if all([k.startswith('module.') for k in emb_reload.keys()]):
+                    emb_reload = {k[len('module.'):]: v for k, v in emb_reload.items()}
+
+                only_emb_reload = {}
+                for key, value in emb_reload.items():
+                    for module_name in emb_name:
+                        if module_name in key:
+                            only_emb_reload[key] = value
+
+                # 预训练模型只有一个，所以使用相同的embedding初始化就可以
+                enc_reload = encoder.state_dict()
+                enc_reload.update(only_emb_reload)
+                encoder.load_state_dict(enc_reload)
+
+                dec_reload = decoder.state_dict()
+                dec_reload.update(emb_reload)
+                decoder.load_state_dict(dec_reload)
+
+        # 使用xlm的embedding来初始化
+        if params.reload_dec_emb_from_xml != '':
+            emb_path = params.reload_dec_emb_from_xml
+
+            if emb_path != '':
+                logger.info("Reloading decoder embedding from %s ..." % emb_path)
+                emb_reload = torch.load(emb_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
+                emb_reload = emb_reload['model' if 'model' in emb_reload else 'encoder']
+                emb_name = ['position_embeddings', 'lang_embeddings', 'embeddings']
+
+                if all([k.startswith('module.') for k in emb_reload.keys()]):
+                    emb_reload = {k[len('module.'):]: v for k, v in emb_reload.items()}
+
+                only_emb_reload = {}
+                for key, value in emb_reload.items():
+                    for module_name in emb_name:
+                        if module_name in key:
+                            only_emb_reload[key] = value
+
+                dec_reload = decoder.state_dict()
+                dec_reload.update(emb_reload)
+                decoder.load_state_dict(dec_reload)
 
         # reload a pretrained model
         if params.reload_model != '':
@@ -177,9 +252,50 @@ def build_model(params, dico):
                             dec_reload[name % i] = decoder.state_dict()[name % i]
                 decoder.load_state_dict(dec_reload)
 
+        # reload a pretrained model for encoder
+        if params.reload_encoder_model != '':
+            enc_path = params.reload_encoder_model
+
+            # reload encoder
+            if enc_path != '':
+                logger.info("Reloading encoder pretrain model from %s ..." % enc_path)
+                enc_reload = torch.load(enc_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
+                enc_reload = enc_reload['model' if 'model' in enc_reload else 'encoder']
+                if all([k.startswith('module.') for k in enc_reload.keys()]):
+                    enc_reload = {k[len('module.'):]: v for k, v in enc_reload.items()}
+                encoder.load_state_dict(enc_reload)
+
+        # embedding层不微调
+        if params.froze_enc_embedding:
+            logger.info("froze_enc_embedding")
+            emb_name = ['position_embeddings', 'lang_embeddings', 'embeddings', 'layer_norm_emb']
+            for name, param in encoder.named_parameters():
+                for _name in emb_name:
+                    if _name in name:
+                        param.requires_grad = False
+                        break
+
+        # encoder的某几层不微调
+        if params.froze_enc:
+            logger.info("froze encoder")
+            layer = params.froze_layer  # 3
+            emb_name = ['position_embeddings', 'lang_embeddings', 'embeddings', 'layer_norm_emb']
+            layer_name = ['attentions.', 'layer_norm1.', 'ffns.', 'layer_norm2.']
+            new_layer_name = copy.deepcopy(emb_name)
+            for i in range(layer):
+                new_layer_name.extend([_name + str(i) for _name in layer_name])
+
+            for name, param in encoder.named_parameters():
+                for _name in new_layer_name:
+                    if _name in name:
+                        param.requires_grad = False
+                        break
+
         logger.debug("Encoder: {}".format(encoder))
         logger.debug("Decoder: {}".format(decoder))
-        logger.info("Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
-        logger.info("Number of parameters (decoder): %i" % sum([p.numel() for p in decoder.parameters() if p.requires_grad]))
+        logger.info(
+            "Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
+        logger.info(
+            "Number of parameters (decoder): %i" % sum([p.numel() for p in decoder.parameters() if p.requires_grad]))
 
         return encoder.cuda(), decoder.cuda()

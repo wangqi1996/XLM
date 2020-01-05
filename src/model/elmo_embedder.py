@@ -1,9 +1,3 @@
-# Copyright (c) 2019-present, Facebook, Inc.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
 import copy
 from logging import getLogger
 import math
@@ -234,7 +228,7 @@ class TransformerFFN(nn.Module):
         return x
 
 
-class TransformerModel(nn.Module):
+class ElmoEncoderModel(nn.Module):
     ATTRIBUTES = ['encoder', 'with_output', 'eos_index', 'pad_index', 'n_langs', 'n_words', 'dim', 'n_layers',
                   'n_heads', 'hidden_dim', 'dropout', 'attention_dropout', 'asm', 'asm_cutoffs', 'asm_div_value']
 
@@ -244,6 +238,8 @@ class TransformerModel(nn.Module):
         """
         super().__init__()
 
+        # 支支持encoder
+        assert is_encoder, u"只支持encoder呀"
         # encoder / decoder, output layer
         self.is_encoder = is_encoder
         self.is_decoder = not is_encoder
@@ -257,7 +253,7 @@ class TransformerModel(nn.Module):
         self.dico = dico
         self.id2lang = params.id2lang
         self.lang2id = params.lang2id
-        self.use_lang_emb = getattr(params, 'use_lang_emb', True)
+        self.use_lang_emb = getattr(params, 'use_lang_emb', True)  # nmt中没使用
         assert len(self.dico) == self.n_words
         assert len(self.id2lang) == len(self.lang2id) == self.n_langs
 
@@ -271,14 +267,14 @@ class TransformerModel(nn.Module):
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
         # embeddings
-        self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
-        if params.sinusoidal_embeddings:
-            create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
-        if params.n_langs > 1 and self.use_lang_emb:
-            self.lang_embeddings = Embedding(self.n_langs, self.dim)
-
-        self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
-        self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
+        # self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
+        # if params.sinusoidal_embeddings:
+        #     create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
+        # if params.n_langs > 1 and self.use_lang_emb:
+        #     self.lang_embeddings = Embedding(self.n_langs, self.dim)
+        #
+        # self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
+        # self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
 
         # transformer layers
         self.attentions = nn.ModuleList()
@@ -289,7 +285,7 @@ class TransformerModel(nn.Module):
             self.layer_norm15 = nn.ModuleList()
             self.encoder_attn = nn.ModuleList()
 
-        # memories
+        # memories (nmt中没使用)
         self.memories = nn.ModuleDict()
         if getattr(params, 'use_memory', False):
             mem_positions = params.mem_enc_positions if is_encoder else params.mem_dec_positions
@@ -329,11 +325,11 @@ class TransformerModel(nn.Module):
         else:
             raise Exception("Unknown mode: %s" % mode)
 
-    def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None,
-            output_hidden=False):
+    def fwd(self, elmo_emb, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None):
         """
         Inputs:
             `x` LongTensor(slen, bs), containing word indices
+            'tensor': x的嵌入表示
             `lengths` LongTensor(bs), containing the length of each sentence
             `causal` Boolean, if True, the attention is only done over previous hidden states
             `positions` LongTensor(slen, bs), containing word positions
@@ -381,16 +377,15 @@ class TransformerModel(nn.Module):
             attn_mask = attn_mask[:, -_slen:]
 
         # embeddings
-        tensor = self.embeddings(x)
-        tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
-        if langs is not None and self.use_lang_emb:
-            tensor = tensor + self.lang_embeddings(langs)
-        tensor = self.layer_norm_emb(tensor)
-        tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        # tensor = self.embeddings(x)
+        # tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
+        # if langs is not None and self.use_lang_emb:
+        #     tensor = tensor + self.lang_embeddings(langs)
+        # tensor = self.layer_norm_emb(tensor)
+        # tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        tensor = elmo_emb
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
-        if output_hidden:
-            hidden_list = [copy.deepcopy(tensor)] # n_layer * [batch_size, seq_len, hidden_dim]
         # transformer layers
         for i in range(self.n_layers):
 
@@ -421,20 +416,14 @@ class TransformerModel(nn.Module):
 
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
-            if output_hidden:
-                hidden_list.append(copy.deepcopy(tensor))
-
         # update cache length
         if cache is not None:
             cache['slen'] += tensor.size(1)
 
         # move back sequence length to dimension 0
-        tensor = tensor.transpose(0, 1)
+        tensor = tensor.transpose(0, 1)  # [seq_len, batch_size, hidden_dim]
 
-        if output_hidden:
-            return tensor, hidden_list
-        else:
-            return tensor
+        return tensor
 
     def predict(self, tensor, pred_mask, y, get_scores):
         """
@@ -447,271 +436,6 @@ class TransformerModel(nn.Module):
         masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
         scores, loss = self.pred_layer(masked_tensor, y, get_scores)
         return scores, loss
-
-    def generate(self, src_enc, src_len, tgt_lang_id, max_len=200, sample_temperature=None):
-        """
-        Decode a sentence given initial start.
-        `x`:
-            - LongTensor(bs, slen)
-                <EOS> W1 W2 W3 <EOS> <PAD>
-                <EOS> W1 W2 W3   W4  <EOS>
-        `lengths`:
-            - LongTensor(bs) [5, 6]
-        `positions`:
-            - False, for regular "arange" positions (LM)
-            - True, to reset positions from the new generation (MT)
-        `langs`:
-            - must be None if the model only supports one language
-            - lang_id if only one language is involved (LM)
-            - (lang_id1, lang_id2) if two languages are involved (MT)
-        """
-
-        # input batch
-        bs = len(src_len)
-        assert src_enc.size(0) == bs
-
-        # generated sentences
-        generated = src_len.new(max_len, bs)  # upcoming output
-        generated.fill_(self.pad_index)  # fill upcoming ouput with <PAD>
-        generated[0].fill_(self.eos_index)  # we use <EOS> for <BOS> everywhere
-
-        # positions
-        positions = src_len.new(max_len).long()
-        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand(max_len, bs)
-
-        # language IDs
-        langs = src_len.new(max_len).long().fill_(tgt_lang_id)
-        langs = langs.unsqueeze(1).expand(max_len, bs)
-
-        # current position / max lengths / length of generated sentences / unfinished sentences
-        cur_len = 1
-        gen_len = src_len.clone().fill_(1)
-        unfinished_sents = src_len.clone().fill_(1)
-
-        # cache compute states
-        cache = {'slen': 0}
-
-        while cur_len < max_len:
-
-            # compute word scores
-            tensor = self.forward(
-                'fwd',
-                x=generated[:cur_len],
-                lengths=gen_len,
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                cache=cache
-            )
-            assert tensor.size() == (1, bs, self.dim), (
-                cur_len, max_len, src_enc.size(), tensor.size(), (1, bs, self.dim))
-            tensor = tensor.data[-1, :, :].type_as(src_enc)  # (bs, dim)
-            scores = self.pred_layer.get_scores(tensor)  # (bs, n_words)
-
-            # select next words: sample or greedy
-            if sample_temperature is None:
-                next_words = torch.topk(scores, 1)[1].squeeze(1)
-            else:
-                next_words = torch.multinomial(F.softmax(scores / sample_temperature, dim=1), 1).squeeze(1)
-            assert next_words.size() == (bs,)
-
-            # update generations / lengths / finished sentences / current length
-            generated[cur_len] = next_words * unfinished_sents + self.pad_index * (1 - unfinished_sents)
-            gen_len.add_(unfinished_sents)
-            unfinished_sents.mul_(next_words.ne(self.eos_index).long())
-            cur_len = cur_len + 1
-
-            # stop when there is a </s> in each sentence, or if we exceed the maximul length
-            if unfinished_sents.max() == 0:
-                break
-
-        # add <EOS> to unfinished sentences
-        if cur_len == max_len:
-            generated[-1].masked_fill_(unfinished_sents.byte(), self.eos_index)
-
-        # sanity check
-        assert (generated == self.eos_index).sum() == 2 * bs
-
-        return generated[:cur_len], gen_len
-
-    def generate_beam(self, src_enc, src_len, tgt_lang_id, beam_size, length_penalty, early_stopping, max_len=200):
-        """
-        Decode a sentence given initial start.
-        `x`:
-            - LongTensor(bs, slen)
-                <EOS> W1 W2 W3 <EOS> <PAD>
-                <EOS> W1 W2 W3   W4  <EOS>
-        `lengths`:
-            - LongTensor(bs) [5, 6]
-        `positions`:
-            - False, for regular "arange" positions (LM)
-            - True, to reset positions from the new generation (MT)
-        `langs`:
-            - must be None if the model only supports one language
-            - lang_id if only one language is involved (LM)
-            - (lang_id1, lang_id2) if two languages are involved (MT)
-        """
-
-        # check inputs
-        assert src_enc.size(0) == src_len.size(0)
-        assert beam_size >= 1
-
-        # batch size / number of words
-        bs = len(src_len)
-        n_words = self.n_words
-
-        # expand to beam size the source latent representations / source lengths
-        src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view(
-            (bs * beam_size,) + src_enc.shape[1:])
-        src_len = src_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
-
-        # generated sentences (batch with beam current hypotheses)
-        generated = src_len.new(max_len, bs * beam_size)  # upcoming output
-        generated.fill_(self.pad_index)  # fill upcoming ouput with <PAD>
-        generated[0].fill_(self.eos_index)  # we use <EOS> for <BOS> everywhere
-
-        # generated hypotheses
-        generated_hyps = [BeamHypotheses(beam_size, max_len, length_penalty, early_stopping) for _ in range(bs)]
-
-        # positions
-        positions = src_len.new(max_len).long()
-        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand_as(generated)
-
-        # language IDs
-        langs = positions.clone().fill_(tgt_lang_id)
-
-        # scores for each sentence in the beam
-        beam_scores = src_enc.new(bs, beam_size).fill_(0)
-        beam_scores[:, 1:] = -1e9
-        beam_scores = beam_scores.view(-1)
-
-        # current position
-        cur_len = 1
-
-        # cache compute states
-        cache = {'slen': 0}
-
-        # done sentences
-        done = [False for _ in range(bs)]
-
-        while cur_len < max_len:
-
-            # compute word scores
-            tensor = self.forward(
-                'fwd',
-                x=generated[:cur_len],
-                lengths=src_len.new(bs * beam_size).fill_(cur_len),
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                cache=cache
-            )
-            assert tensor.size() == (1, bs * beam_size, self.dim)
-            tensor = tensor.data[-1, :, :]  # (bs * beam_size, dim)
-            scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
-            scores = F.log_softmax(scores, dim=-1)  # (bs * beam_size, n_words)
-            assert scores.size() == (bs * beam_size, n_words)
-
-            # select next words with scores
-            _scores = scores + beam_scores[:, None].expand_as(scores)  # (bs * beam_size, n_words)
-            _scores = _scores.view(bs, beam_size * n_words)  # (bs, beam_size * n_words)
-
-            next_scores, next_words = torch.topk(_scores, 2 * beam_size, dim=1, largest=True, sorted=True)
-            assert next_scores.size() == next_words.size() == (bs, 2 * beam_size)
-
-            # next batch beam content
-            # list of (bs * beam_size) tuple(next hypothesis score, next word, current position in the batch)
-            next_batch_beam = []
-
-            # for each sentence
-            for sent_id in range(bs):
-
-                # if we are done with this sentence
-                done[sent_id] = done[sent_id] or generated_hyps[sent_id].is_done(next_scores[sent_id].max().item())
-                if done[sent_id]:
-                    next_batch_beam.extend([(0, self.pad_index, 0)] * beam_size)  # pad the batch
-                    continue
-
-                # next sentence beam content
-                next_sent_beam = []
-
-                # next words for this sentence
-                for idx, value in zip(next_words[sent_id], next_scores[sent_id]):
-
-                    # get beam and word IDs
-                    beam_id = idx // n_words
-                    word_id = idx % n_words
-
-                    # end of sentence, or next word
-                    if word_id == self.eos_index or cur_len + 1 == max_len:
-                        generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(),
-                                                    value.item())
-                    else:
-                        next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
-
-                    # the beam for next step is full
-                    if len(next_sent_beam) == beam_size:
-                        break
-
-                # update next beam content
-                assert len(next_sent_beam) == 0 if cur_len + 1 == max_len else beam_size
-                if len(next_sent_beam) == 0:
-                    next_sent_beam = [(0, self.pad_index, 0)] * beam_size  # pad the batch
-                next_batch_beam.extend(next_sent_beam)
-                assert len(next_batch_beam) == beam_size * (sent_id + 1)
-
-            # sanity check / prepare next batch
-            assert len(next_batch_beam) == bs * beam_size
-            beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
-            beam_words = generated.new([x[1] for x in next_batch_beam])
-            beam_idx = src_len.new([x[2] for x in next_batch_beam])
-
-            # re-order batch and internal states
-            generated = generated[:, beam_idx]
-            generated[cur_len] = beam_words
-            for k in cache.keys():
-                if k != 'slen':
-                    cache[k] = (cache[k][0][beam_idx], cache[k][1][beam_idx])
-
-            # update current length
-            cur_len = cur_len + 1
-
-            # stop when we are done with each sentence
-            if all(done):
-                break
-
-        # visualize hypotheses
-        # print([len(x) for x in generated_hyps], cur_len)
-        # globals().update( locals() );
-        # !import code; code.interact(local=vars())
-        # for ii in range(bs):
-        #     for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
-        #         print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
-        #     print("")
-
-        # select the best hypotheses
-        tgt_len = src_len.new(bs)
-        best = []
-
-        for i, hypotheses in enumerate(generated_hyps):
-            best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
-            tgt_len[i] = len(best_hyp) + 1  # +1 for the <EOS> symbol
-            best.append(best_hyp)
-
-        # generate target batch
-        decoded = src_len.new(tgt_len.max().item(), bs).fill_(self.pad_index)
-        for i, hypo in enumerate(best):
-            decoded[:tgt_len[i] - 1, i] = hypo
-            decoded[tgt_len[i] - 1, i] = self.eos_index
-
-        # sanity check
-        assert (decoded == self.eos_index).sum() == 2 * bs
-
-        return decoded, tgt_len
 
 
 class BeamHypotheses(object):
@@ -758,3 +482,84 @@ class BeamHypotheses(object):
             return True
         else:
             return self.worst_score >= best_sum_logprobs / self.max_len ** self.length_penalty
+
+
+class ElmoTokenEmbedder(nn.Module):
+    def __init__(self, params, tune_lm, layer_norm=True, init_gamma=1.0, apply_softmax=True):
+        super().__init__()
+        self.language_model = params.language_model
+        # no fine tune language model
+        if not tune_lm:
+            for param in self.language_model.parameters():
+                param.requires_grad = False
+            self.language_model.eval()
+        self.tune_lm = tune_lm
+        self.n_layers = self.language_model.n_layers
+        self.hidden_dim = self.language_model.dim
+        self.weight_dropout = 0.2
+        self.weight_dropout = nn.Dropout(self.weight_dropout)
+        self.final_dropout = params.dropout
+        self.final_dropout = nn.Dropout(self.final_dropout)
+        self.layer_norm = None
+        if layer_norm:
+            self.layer_norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=True)
+
+        self.weight = nn.Parameter(torch.Tensor(self.n_layers + 1).fill_(1.0), requires_grad=True)
+        self.softmax = nn.Softmax(dim=-1) if apply_softmax else None
+
+        self.gamma = nn.Parameter(torch.full((1,), init_gamma), requires_grad=True)
+
+    def reset_parameters(self):
+        if self.softmax is not None:
+            nn.init.constant_(self.weight, 1 / (self.num_layers * 2))
+
+    def forward(self, mode, **kwargs):
+        new_kwargs = copy.deepcopy(kwargs)
+        new_kwargs.update({
+            "output_hidden": True
+        })
+        with torch.no_grad():
+            if self.language_model.training:
+                self.language_model.eval()
+            # hidden_list: 6 * (batch_size, seq_len, hidden_dim) [46, 26, 1024]
+            _, hidden_list = self.language_model(mode, **new_kwargs)
+
+        # 对每一层应用layer_norm
+        hidden_list = [self.layer_norm(s) for s in hidden_list]
+
+        # 对权重做softmax
+        if self.softmax:
+            dis = self.softmax(self.weight)
+        else:
+            dis = self.weight
+
+        dis = self.weight_dropout(dis)
+
+        hidden_tensor = torch.stack(hidden_list, dim=0)
+        dis = dis.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+        result = dis * hidden_tensor
+        result = result.sum(dim=0, keepdim=False)
+
+        if self.gamma:
+            result = self.gamma * result
+
+        result = self.final_dropout(result)
+
+        return result
+
+
+class ELMOTransEncoder(nn.Module):
+    def __init__(self, params, dico, is_encoder=True, with_output=True):
+        super().__init__()
+        self.ete = ElmoTokenEmbedder(params, tune_lm=False)
+        self.transNMT = ElmoEncoderModel(params, dico, is_encoder, with_output=False)
+
+    def forward(self, mode, **kwargs):
+        elmo_emb = self.ete(mode, **kwargs)
+        new_kwargs = copy.deepcopy(kwargs)
+        new_kwargs.update({
+            "elmo_emb": elmo_emb
+        })
+        output = self.transNMT(mode, **new_kwargs)
+        return output

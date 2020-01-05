@@ -127,3 +127,11 @@ dmypy.json
 # /tools
 /data
 /dumped
+/tools/
+/get-data-glue.sh
+/get-data-nmt.sh
+/get-data-nmt2.sh
+/get-data-para.sh
+/get-data-wiki.sh
+/get-data-xnli.sh
+/.idea

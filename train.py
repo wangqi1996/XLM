@@ -9,10 +9,12 @@ import json
 import random
 import argparse
 
+import torch
+
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
 from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
-from src.model import check_model_params, build_model
+from src.model import check_model_params, build_model, TransformerModel
 from src.model.memory import HashingMemory
 from src.trainer import SingleTrainer, EncDecTrainer
 from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator
@@ -183,6 +185,14 @@ def get_parser():
                         help="Reload a pretrained model")
     parser.add_argument("--reload_checkpoint", type=str, default="",
                         help="Reload a checkpoint")
+    parser.add_argument("--reload_emb_from_xml", type=str, default="",
+                        help="Reload a reload_emb_from_xml")
+    parser.add_argument("--reload_dec_emb_from_xml", type=str, default="",
+                        help="Reload a reload_emb_from_xml for decoder")
+    parser.add_argument('--encoder_elmo_path', default="", type=str,
+                        help='use pretrain model by elmo-style, pretrain model path')
+    parser.add_argument("--reload_encoder_model", type=str, default="",
+                        help="Reload a pretrained model for encoder")
 
     # beam search (for MT only)
     parser.add_argument("--beam_size", type=int, default=1,
@@ -212,11 +222,16 @@ def get_parser():
     parser.add_argument("--master_port", type=int, default=-1,
                         help="Master port (for multi-node SLURM jobs)")
 
+    # froze
+    parser.add_argument("--froze_enc_embedding", type=bool_flag, default=False,
+                        help="froze_enc_embedding")
+    parser.add_argument("--froze_enc", type=bool_flag, default=False,
+                        help="froze_enc")
+    parser.add_argument("--froze_layer", type=int, default=3, help='froze_layer')
     return parser
 
 
 def main(params):
-
     # initialize the multi-GPU / multi-node training
     init_distributed_mode(params)
 
