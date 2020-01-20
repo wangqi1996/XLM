@@ -161,6 +161,9 @@ def build_model(params, dico):
             pretrain_model.load_state_dict(reloaded)
             params.language_model = pretrain_model
             encoder = ELMOTransEncoder(params, dico, is_encoder=True, with_output=True)
+        elif params.encoder_fusion_path != '':
+            # 按照wengrx师兄的论文实现train
+            pass
         else:
             # build
             encoder = TransformerModel(params, dico, is_encoder=True,

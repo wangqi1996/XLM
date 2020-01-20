@@ -193,6 +193,8 @@ def get_parser():
                         help='use pretrain model by elmo-style, pretrain model path')
     parser.add_argument("--reload_encoder_model", type=str, default="",
                         help="Reload a pretrained model for encoder")
+    parser.add_argument("--encoder_fusion_path", type=str, default="",
+                        help="pretrain model path, use pretrain model with fusion style, (wengrx)")
 
     # beam search (for MT only)
     parser.add_argument("--beam_size", type=int, default=1,
