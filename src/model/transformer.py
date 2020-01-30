@@ -262,9 +262,9 @@ class TransformerModel(nn.Module):
         assert len(self.id2lang) == len(self.lang2id) == self.n_langs
 
         # model parameters
-        self.dim = params.emb_dim  # 512 by default
-        self.hidden_dim = self.dim * 4  # 2048 by default
-        self.n_heads = params.n_heads  # 8 by default
+        self.dim = params.emb_dim  # 1024
+        self.hidden_dim = self.dim * 4  #
+        self.n_heads = params.n_heads  #
         self.n_layers = params.n_layers
         self.dropout = params.dropout
         self.attention_dropout = params.attention_dropout
@@ -390,7 +390,7 @@ class TransformerModel(nn.Module):
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
         if output_hidden:
-            hidden_list = [copy.deepcopy(tensor)] # n_layer * [batch_size, seq_len, hidden_dim]
+            hidden_list = [tensor] # n_layer * [batch_size, seq_len, hidden_dim]
         # transformer layers
         for i in range(self.n_layers):
 
@@ -422,7 +422,7 @@ class TransformerModel(nn.Module):
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
             if output_hidden:
-                hidden_list.append(copy.deepcopy(tensor))
+                hidden_list.append(tensor)
 
         # update cache length
         if cache is not None:

@@ -234,7 +234,7 @@ class TransformerFFN(nn.Module):
         return x
 
 
-class FusionEncoderModel(nn.Module):
+class AddPretrainTransModel(nn.Module):
     ATTRIBUTES = ['encoder', 'with_output', 'eos_index', 'pad_index', 'n_langs', 'n_words', 'dim', 'n_layers',
                   'n_heads', 'hidden_dim', 'dropout', 'attention_dropout', 'asm', 'asm_cutoffs', 'asm_div_value']
 
@@ -243,6 +243,9 @@ class FusionEncoderModel(nn.Module):
         Transformer model (encoder or decoder).
         """
         super().__init__()
+
+        self.pretrain_model = params.pretrain_model
+        # self.attn_alpha = nn.Parameter(torch.FloatTensor(params.n_layers).fill_(1).float(), requires_grad=True)
 
         # encoder / decoder, output layer
         self.is_encoder = is_encoder
@@ -330,7 +333,7 @@ class FusionEncoderModel(nn.Module):
             raise Exception("Unknown mode: %s" % mode)
 
     def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None,
-            output_hidden=False, fusion_hiddens=None):
+            output_hidden=False):
         """
         Inputs:
             `x` LongTensor(slen, bs), containing word indices
@@ -341,6 +344,16 @@ class FusionEncoderModel(nn.Module):
         """
         # lengths = (x != self.pad_index).float().sum(dim=1)
         # mask = x != self.pad_index
+
+        # get pretrain model output
+        with torch.no_grad():
+            if self.pretrain_model.training:
+                self.pretrain_model.eval()
+            pretrain_output = self.pretrain_model('fwd', x=x, lengths=lengths, langs=langs, causal=False,
+                                                 output_hidden=False)
+
+            # [batch_size, seq_len, hidden_dim]
+            pretrain_output = pretrain_output.transpose(0, 1)
 
         # check inputs
         slen, bs = x.size()
@@ -390,12 +403,13 @@ class FusionEncoderModel(nn.Module):
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
         if output_hidden:
-            hidden_list = [tensor]  # n_layer * [batch_size, seq_len, hidden_dim]
+            hidden_list = [tensor] # n_layer * [batch_size, seq_len, hidden_dim]
         # transformer layers
         for i in range(self.n_layers):
 
+            tensor1 = tensor + pretrain_output
             # self attention
-            attn = self.attentions[i](tensor, attn_mask, cache=cache)
+            attn = self.attentions[i](tensor1, attn_mask, cache=cache)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
             tensor = tensor + attn
             tensor = self.layer_norm1[i](tensor)
@@ -419,19 +433,8 @@ class FusionEncoderModel(nn.Module):
                 tensor = tensor + self.memories['%i_after' % i](tensor)
             # TODO: add extra layer norm here?
 
-            # [batch_size, seq_len, hidden_dim]
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
-            # TODO mask?????
-            # wenrongxiang师兄论文
-            # [batch_size, 1]
-            seq_lens = mask.long().sum(dim=1, keepdim=True).float()
-            # [batch_size, hidden_dim]
-            sum_rns = tensor.sum(dim=1, keepdim=False).float()
-            # [batch_size, hidden_dim]
-            avg_rns = sum_rns / seq_lens
-            # [batch_size, hidden_dim]
-            theta = F.sigmoid(avg_rns)
-            tensor = tensor + theta.unsqueeze(1) * fusion_hiddens[i]
+
             if output_hidden:
                 hidden_list.append(tensor)
 
@@ -439,7 +442,7 @@ class FusionEncoderModel(nn.Module):
         if cache is not None:
             cache['slen'] += tensor.size(1)
 
-        # move back sequence length to dimension 0
+        # move back sequence length to dimension 0 [seq_len, batch_size, hidden_dim]
         tensor = tensor.transpose(0, 1)
 
         if output_hidden:
@@ -547,54 +550,225 @@ class FusionEncoderModel(nn.Module):
 
         return generated[:cur_len], gen_len
 
+    def generate_beam(self, src_enc, src_len, tgt_lang_id, beam_size, length_penalty, early_stopping, max_len=200):
+        """
+        Decode a sentence given initial start.
+        `x`:
+            - LongTensor(bs, slen)
+                <EOS> W1 W2 W3 <EOS> <PAD>
+                <EOS> W1 W2 W3   W4  <EOS>
+        `lengths`:
+            - LongTensor(bs) [5, 6]
+        `positions`:
+            - False, for regular "arange" positions (LM)
+            - True, to reset positions from the new generation (MT)
+        `langs`:
+            - must be None if the model only supports one language
+            - lang_id if only one language is involved (LM)
+            - (lang_id1, lang_id2) if two languages are involved (MT)
+        """
 
-class FusionTransEncoder(nn.Module):
-    def __init__(self, params, dico, is_encoder=True, with_output=True, style=1):
-        super().__init__()
-        self.fusion_model = params.fusion_model
-        self.transNMT = FusionEncoderModel(params, dico, is_encoder, with_output=False)
+        # check inputs
+        assert src_enc.size(0) == src_len.size(0)
+        assert beam_size >= 1
 
-        trans_layers = self.transNMT.n_layers
-        fusion_layers = self.fusion_model.n_layers
-        self.fusion_style = style
-        if style == 1:
-            self.fusion_W = nn.Parameter(
-                torch.FloatTensor(trans_layers, fusion_layers, self.transNMT.dim).fill_(1 / fusion_layers).float(),
-                requires_grad=True)
+        # batch size / number of words
+        bs = len(src_len)
+        n_words = self.n_words
+
+        # expand to beam size the source latent representations / source lengths
+        src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view(
+            (bs * beam_size,) + src_enc.shape[1:])
+        src_len = src_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
+
+        # generated sentences (batch with beam current hypotheses)
+        generated = src_len.new(max_len, bs * beam_size)  # upcoming output
+        generated.fill_(self.pad_index)  # fill upcoming ouput with <PAD>
+        generated[0].fill_(self.eos_index)  # we use <EOS> for <BOS> everywhere
+
+        # generated hypotheses
+        generated_hyps = [BeamHypotheses(beam_size, max_len, length_penalty, early_stopping) for _ in range(bs)]
+
+        # positions
+        positions = src_len.new(max_len).long()
+        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand_as(generated)
+
+        # language IDs
+        langs = positions.clone().fill_(tgt_lang_id)
+
+        # scores for each sentence in the beam
+        beam_scores = src_enc.new(bs, beam_size).fill_(0)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+
+        # current position
+        cur_len = 1
+
+        # cache compute states
+        cache = {'slen': 0}
+
+        # done sentences
+        done = [False for _ in range(bs)]
+
+        while cur_len < max_len:
+
+            # compute word scores
+            tensor = self.forward(
+                'fwd',
+                x=generated[:cur_len],
+                lengths=src_len.new(bs * beam_size).fill_(cur_len),
+                positions=positions[:cur_len],
+                langs=langs[:cur_len],
+                causal=True,
+                src_enc=src_enc,
+                src_len=src_len,
+                cache=cache
+            )
+            assert tensor.size() == (1, bs * beam_size, self.dim)
+            tensor = tensor.data[-1, :, :]  # (bs * beam_size, dim)
+            scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
+            scores = F.log_softmax(scores, dim=-1)  # (bs * beam_size, n_words)
+            assert scores.size() == (bs * beam_size, n_words)
+
+            # select next words with scores
+            _scores = scores + beam_scores[:, None].expand_as(scores)  # (bs * beam_size, n_words)
+            _scores = _scores.view(bs, beam_size * n_words)  # (bs, beam_size * n_words)
+
+            next_scores, next_words = torch.topk(_scores, 2 * beam_size, dim=1, largest=True, sorted=True)
+            assert next_scores.size() == next_words.size() == (bs, 2 * beam_size)
+
+            # next batch beam content
+            # list of (bs * beam_size) tuple(next hypothesis score, next word, current position in the batch)
+            next_batch_beam = []
+
+            # for each sentence
+            for sent_id in range(bs):
+
+                # if we are done with this sentence
+                done[sent_id] = done[sent_id] or generated_hyps[sent_id].is_done(next_scores[sent_id].max().item())
+                if done[sent_id]:
+                    next_batch_beam.extend([(0, self.pad_index, 0)] * beam_size)  # pad the batch
+                    continue
+
+                # next sentence beam content
+                next_sent_beam = []
+
+                # next words for this sentence
+                for idx, value in zip(next_words[sent_id], next_scores[sent_id]):
+
+                    # get beam and word IDs
+                    beam_id = idx // n_words
+                    word_id = idx % n_words
+
+                    # end of sentence, or next word
+                    if word_id == self.eos_index or cur_len + 1 == max_len:
+                        generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(),
+                                                    value.item())
+                    else:
+                        next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
+
+                    # the beam for next step is full
+                    if len(next_sent_beam) == beam_size:
+                        break
+
+                # update next beam content
+                assert len(next_sent_beam) == 0 if cur_len + 1 == max_len else beam_size
+                if len(next_sent_beam) == 0:
+                    next_sent_beam = [(0, self.pad_index, 0)] * beam_size  # pad the batch
+                next_batch_beam.extend(next_sent_beam)
+                assert len(next_batch_beam) == beam_size * (sent_id + 1)
+
+            # sanity check / prepare next batch
+            assert len(next_batch_beam) == bs * beam_size
+            beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
+            beam_words = generated.new([x[1] for x in next_batch_beam])
+            beam_idx = src_len.new([x[2] for x in next_batch_beam])
+
+            # re-order batch and internal states
+            generated = generated[:, beam_idx]
+            generated[cur_len] = beam_words
+            for k in cache.keys():
+                if k != 'slen':
+                    cache[k] = (cache[k][0][beam_idx], cache[k][1][beam_idx])
+
+            # update current length
+            cur_len = cur_len + 1
+
+            # stop when we are done with each sentence
+            if all(done):
+                break
+
+        # visualize hypotheses
+        # print([len(x) for x in generated_hyps], cur_len)
+        # globals().update( locals() );
+        # !import code; code.interact(local=vars())
+        # for ii in range(bs):
+        #     for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
+        #         print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
+        #     print("")
+
+        # select the best hypotheses
+        tgt_len = src_len.new(bs)
+        best = []
+
+        for i, hypotheses in enumerate(generated_hyps):
+            best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
+            tgt_len[i] = len(best_hyp) + 1  # +1 for the <EOS> symbol
+            best.append(best_hyp)
+
+        # generate target batch
+        decoded = src_len.new(tgt_len.max().item(), bs).fill_(self.pad_index)
+        for i, hypo in enumerate(best):
+            decoded[:tgt_len[i] - 1, i] = hypo
+            decoded[tgt_len[i] - 1, i] = self.eos_index
+
+        # sanity check
+        assert (decoded == self.eos_index).sum() == 2 * bs
+
+        return decoded, tgt_len
+
+
+class BeamHypotheses(object):
+
+    def __init__(self, n_hyp, max_len, length_penalty, early_stopping):
+        """
+        Initialize n-best list of hypotheses.
+        """
+        self.max_len = max_len - 1  # ignoring <BOS>
+        self.length_penalty = length_penalty
+        self.early_stopping = early_stopping
+        self.n_hyp = n_hyp
+        self.hyp = []
+        self.worst_score = 1e9
+
+    def __len__(self):
+        """
+        Number of hypotheses in the list.
+        """
+        return len(self.hyp)
+
+    def add(self, hyp, sum_logprobs):
+        """
+        Add a new hypothesis to the list.
+        """
+        score = sum_logprobs / len(hyp) ** self.length_penalty
+        if len(self) < self.n_hyp or score > self.worst_score:
+            self.hyp.append((score, hyp))
+            if len(self) > self.n_hyp:
+                sorted_scores = sorted([(s, idx) for idx, (s, _) in enumerate(self.hyp)])
+                del self.hyp[sorted_scores[0][1]]
+                self.worst_score = sorted_scores[1][0]
+            else:
+                self.worst_score = min(score, self.worst_score)
+
+    def is_done(self, best_sum_logprobs):
+        """
+        If there are enough hypotheses and that none of the hypotheses being generated
+        can become better than the worst one in the heap, then we are done with this sentence.
+        """
+        if len(self) < self.n_hyp:
+            return False
+        elif self.early_stopping:
+            return True
         else:
-            self.fusion_W = nn.Parameter(
-                torch.FloatTensor(trans_layers, fusion_layers).fill_(1 / fusion_layers).float(),
-                requires_grad=True)
-
-    def forward(self, mode, **kwargs):
-        # 获取隐层输出
-
-        raw_output_hidden = kwargs.get("output_hidden", False)
-        kwargs.update({
-            "output_hidden": True
-        })
-        # hidden_output: [num_layers, [batch_size, seq_len, hidden_dim] ]
-        with torch.no_grad():
-            if self.fusion_model.training:
-                self.fusion_model.eval()
-            _, hidden_list = self.fusion_model(mode, **kwargs)
-
-        #  去掉embedded层
-        hiddens = torch.stack(hidden_list[1:], dim=0)
-        # [1, num_layers, [batch_size, seq_len, hidden_dim]
-        hiddens = hiddens.unsqueeze(0)
-        # [nmt_layers, fusion_layers, 1, 1, 1]
-        if self.fusion_style == 1:
-            fusion_W = self.fusion_W.unsqueeze(-2).unsqueeze(-2)
-        else:
-            fusion_W = self.fusion_W.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        # [nmt_layers, batch_size, seq_len, hidden_dim]
-        RW_hidden = (hiddens * fusion_W).sum(dim=1, keepdim=False)
-
-        kwargs.update({
-            "output_hidden": raw_output_hidden,
-            "fusion_hiddens": RW_hidden
-        })
-        output = self.transNMT(mode, **kwargs)
-
-        return output
+            return self.worst_score >= best_sum_logprobs / self.max_len ** self.length_penalty

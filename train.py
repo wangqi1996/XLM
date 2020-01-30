@@ -13,7 +13,7 @@ import torch
 
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
-from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
+from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order, split_dataset
 from src.model import check_model_params, build_model, TransformerModel
 from src.model.memory import HashingMemory
 from src.trainer import SingleTrainer, EncDecTrainer
@@ -193,8 +193,19 @@ def get_parser():
                         help='use pretrain model by elmo-style, pretrain model path')
     parser.add_argument("--reload_encoder_model", type=str, default="",
                         help="Reload a pretrained model for encoder")
+    parser.add_argument("--pretrain_attn_model_path", type=str, default="",
+                        help="Reload a pretrained model for encoder, use attn")
+
     parser.add_argument("--encoder_fusion_path", type=str, default="",
                         help="pretrain model path, use pretrain model with fusion style, (wengrx)")
+    parser.add_argument("--fusion_style", type=int, default=1,
+                        help="fusion_w, (wengrx)")
+
+    parser.add_argument("--encoder_KD", type=str, default="",
+                        help="use knowledge distillation for encoder, (wengrx)")
+
+    parser.add_argument("--add_pretrain_path", type=str, default="",
+                        help="add pretrain model output and the NMT embedding")
 
     # beam search (for MT only)
     parser.add_argument("--beam_size", type=int, default=1,
@@ -336,9 +347,17 @@ if __name__ == '__main__':
         params.debug_slurm = True
         params.debug_train = True
 
-    # check parameters
+    # check parameterss
     check_data_params(params)
     check_model_params(params)
 
     # run experiment
     main(params)
+
+
+# if __name__ == '__main__':
+#     a = '/home/user_data55/wangdq/model/XLM/data2/para/de/all.de'
+#     b = '/home/user_data55/wangdq/model/XLM/data2/para/en/all.en'
+#     print('split')
+#     split_dataset(int(4500966/8), [a, b], '/home/user_data55/wangdq/model/XLM/data05M.3')
+#

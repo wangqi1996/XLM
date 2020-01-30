@@ -23,7 +23,6 @@ from .utils import parse_lambda_config, update_lambdas
 from .model.memory import HashingMemory
 from .model.transformer import TransformerFFN
 
-
 logger = getLogger()
 
 
@@ -60,7 +59,9 @@ class Trainer(object):
         if params.multi_gpu and params.amp == -1:
             logger.info("Using nn.parallel.DistributedDataParallel ...")
             for name in self.MODEL_NAMES:
-                setattr(self, name, nn.parallel.DistributedDataParallel(getattr(self, name), device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True))
+                setattr(self, name,
+                        nn.parallel.DistributedDataParallel(getattr(self, name), device_ids=[params.local_rank],
+                                                            output_device=params.local_rank, broadcast_buffers=True))
 
         # set optimizers
         self.set_optimizers()
@@ -71,7 +72,8 @@ class Trainer(object):
             if params.multi_gpu:
                 logger.info("Using apex.parallel.DistributedDataParallel ...")
                 for name in self.MODEL_NAMES:
-                    setattr(self, name, apex.parallel.DistributedDataParallel(getattr(self, name), delay_allreduce=True))
+                    setattr(self, name,
+                            apex.parallel.DistributedDataParallel(getattr(self, name), delay_allreduce=True))
 
         # stopping criterion used for early stopping
         if params.stopping_criterion != '':
@@ -95,7 +97,7 @@ class Trainer(object):
         counts = np.array(list(self.data['dico'].counts.values()))
         params.mask_scores = np.maximum(counts, 1) ** -params.sample_alpha
         params.mask_scores[params.pad_index] = 0  # do not predict <PAD> index
-        params.mask_scores[counts == 0] = 0       # do not predict special tokens
+        params.mask_scores[counts == 0] = 0  # do not predict special tokens
 
         # validation metrics
         self.metrics = []
@@ -286,7 +288,8 @@ class Trainer(object):
         """
         Create a new iterator for a dataset.
         """
-        logger.info("Creating new training data iterator (%s) ..." % ','.join([str(x) for x in [iter_name, lang1, lang2] if x is not None]))
+        logger.info("Creating new training data iterator (%s) ..." % ','.join(
+            [str(x) for x in [iter_name, lang1, lang2] if x is not None]))
         assert stream or not self.params.use_memory or not self.params.mem_query_batchnorm
         if lang2 is None:
             if stream:
@@ -483,10 +486,12 @@ class Trainer(object):
             (x1, len1) = self.get_batch(name, lang1)
             (x2, len2) = (x1, len1)
             (x1, len1) = self.add_noise(x1, len1)
-            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
+            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index,
+                                                          params.eos_index, reset_positions=False)
         else:
             (x1, len1), (x2, len2) = self.get_batch(name, lang1, lang2)
-            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
+            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index,
+                                                          params.eos_index, reset_positions=True)
 
         return x, lengths, positions, langs, (None, None) if lang2 is None else (len1, len2)
 
@@ -593,7 +598,8 @@ class Trainer(object):
         End the epoch.
         """
         # stop if the stopping criterion has not improved after a certain number of epochs
-        if self.stopping_criterion is not None and (self.params.is_master or not self.stopping_criterion[0].endswith('_mt_bleu')):
+        if self.stopping_criterion is not None and (
+                self.params.is_master or not self.stopping_criterion[0].endswith('_mt_bleu')):
             metric, biggest = self.stopping_criterion
             assert metric in scores, metric
             factor = 1 if biggest else -1
@@ -759,7 +765,8 @@ class Trainer(object):
         x2, len2 = x2[:, idx], len2[idx]
 
         # generate batch / cuda
-        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
+        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index,
+                                                      params.eos_index, reset_positions=False)
         x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
         if new_idx is not None:
             y = y[new_idx]
@@ -788,7 +795,6 @@ class Trainer(object):
 class SingleTrainer(Trainer):
 
     def __init__(self, model, data, params):
-
         self.MODEL_NAMES = ['model']
 
         # model / data / params
@@ -848,7 +854,12 @@ class EncDecTrainer(Trainer):
         x1, len1, langs1, x2, len2, langs2, y = to_cuda(x1, len1, langs1, x2, len2, langs2, y)
 
         # encode source sentence
-        enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+        if params.encoder_KD_model is not None:
+            enc1, encoder_hiddens = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False,
+                                                 output_hidden=True)
+        else:
+            enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+
         enc1 = enc1.transpose(0, 1)
 
         # decode target sentence
@@ -858,6 +869,9 @@ class EncDecTrainer(Trainer):
         _, loss = self.decoder('predict', tensor=dec2, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('AE-%s' % lang1) if lang1 == lang2 else ('MT-%s-%s' % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
+
+        if params.encoder_KD_model is not None:
+            loss = params.KD_encoder(loss, encoder_hiddens, x1, len1, langs1)
 
         # optimize
         self.optimize(loss)
@@ -891,7 +905,6 @@ class EncDecTrainer(Trainer):
 
         # generate a translation
         with torch.no_grad():
-
             # evaluation mode
             self.encoder.eval()
             self.decoder.eval()

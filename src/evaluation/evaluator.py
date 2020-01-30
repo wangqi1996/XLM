@@ -17,6 +17,7 @@ from ..model.memory import HashingMemory
 
 
 BLEU_SCRIPT_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'multi-bleu.perl')
+print("!!!!!!bleu_path", BLEU_SCRIPT_PATH)
 assert os.path.isfile(BLEU_SCRIPT_PATH)
 
 
@@ -512,7 +513,7 @@ class EncDecEvaluator(Evaluator):
             hyp_name = 'hyp{0}.{1}-{2}.{3}.txt'.format(scores['epoch'], lang1, lang2, data_set)
             hyp_path = os.path.join(params.hyp_path, hyp_name)
             ref_path = params.ref_paths[(lang1, lang2, data_set)]
-
+            print(hyp_path)
             # export sentences to hypothesis file / restore BPE segmentation
             with open(hyp_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(hypothesis) + '\n')

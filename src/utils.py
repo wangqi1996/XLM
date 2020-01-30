@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from .logger import create_logger
-
+import numpy as np
 
 FALSY_STRINGS = {'off', 'false', '0'}
 TRUTHY_STRINGS = {'on', 'true', '1'}
@@ -275,8 +275,10 @@ def shuf_order(langs, params=None, n=5):
         p_mono = p_mono / p_mono.sum()
         p_para = p_para / p_para.sum()
 
-    s_mono = [mono[i] for i in np.random.choice(len(mono), size=min(n, len(mono)), p=p_mono, replace=True)] if len(mono) > 0 else []
-    s_para = [para[i] for i in np.random.choice(len(para), size=min(n, len(para)), p=p_para, replace=True)] if len(para) > 0 else []
+    s_mono = [mono[i] for i in np.random.choice(len(mono), size=min(n, len(mono)), p=p_mono, replace=True)] if len(
+        mono) > 0 else []
+    s_para = [para[i] for i in np.random.choice(len(para), size=min(n, len(para)), p=p_para, replace=True)] if len(
+        para) > 0 else []
 
     assert len(s_mono) + len(s_para) > 0
     return [(lang, None) for lang in s_mono] + s_para
@@ -292,3 +294,53 @@ def find_modules(module, module_name, module_instance, found):
         for name, child in module.named_children():
             name = ('%s[%s]' if name.isdigit() else '%s.%s') % (module_name, name)
             find_modules(child, name, module_instance, found)
+
+
+def split_dataset(nums, filename_list, new_dir, all_num=4500966):
+    """
+    随机选择nums个训练数据
+    默认filename_list的文件中有相同的行数
+    """
+    # 获取总行数
+
+    assert len(filename_list) > 0
+    # 生命不能承受之重？？？
+    if all_num <= 0:
+        with open(filename_list[0], 'r') as f:
+            all_num = len(f.readlines())
+
+    indexs = random.sample(range(all_num), nums)
+    indexs = sorted(indexs)
+
+    for file in filename_list:
+        print(file)
+        new_file = os.path.join(new_dir, 'para/' + os.path.basename(file))
+
+        if not os.path.exists(new_file):
+            os.makedirs(os.path.dirname(new_file), exist_ok=True)
+
+        print("load dataset")
+        new_lines = []
+        with open(file, 'r') as f:
+            lines = f.readlines()
+        print("process_file")
+        index_id = 0
+        with open(new_file, 'w') as f:
+            for index, line in enumerate(lines):
+                if index == indexs[index_id]:
+                    new_lines.append(line)
+                    index_id += 1
+                    if index_id >= len(indexs):
+                        break
+                if index % 10000 == 0 and len(new_lines) > 0:
+                    f.writelines(new_lines)
+                    new_lines = []
+
+            if len(new_lines) > 0:
+                f.writelines(new_lines)
+
+        print('end %s' % file)
+
+    dev_dir = os.path.join(new_dir, 'para/dev')
+    os.system('mkdir -p %s' % dev_dir)
+    os.system('cp -rp /home/user_data55/wangdq/model/XLM/data2/para/dev/ %s' % dev_dir)

@@ -9,7 +9,11 @@ from logging import getLogger
 import os
 import torch
 
+from src.model.KD import KD_encoder
+from src.model.add_pretrain import AddPretrainTransModel
+from src.model.attn_transformers import PretrainAttnTransModel
 from src.model.elmo_embedder import ELMOTransEncoder
+from src.model.fusion_transformer import FusionTransEncoder
 from .pretrain import load_embeddings
 from .transformer import DECODER_ONLY_PARAMS, TransformerModel  # , TRANSFORMER_LAYER_PARAMS
 from .memory import HashingMemory
@@ -163,12 +167,68 @@ def build_model(params, dico):
             encoder = ELMOTransEncoder(params, dico, is_encoder=True, with_output=True)
         elif params.encoder_fusion_path != '':
             # 按照wengrx师兄的论文实现train
-            pass
+            logger.info("Reloading encoder_fusion_path from %s ..." % params.encoder_fusion_path)
+            pretrain_model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+            reloaded = \
+                torch.load(params.encoder_fusion_path,
+                           map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
+            if all([k.startswith('module.') for k in reloaded.keys()]):
+                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
+
+            pretrain_model.load_state_dict(reloaded)
+            params.fusion_model = pretrain_model
+            encoder = FusionTransEncoder(params, dico, is_encoder=True, with_output=True, style=params.fusion_style)
+        elif params.pretrain_attn_model_path != '':
+            # 按照wengrx师兄的论文实现train
+            logger.info("Reloading pretrain_attn_model_path from %s ..." % params.pretrain_attn_model_path)
+            pretrain_model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+            reloaded = \
+                torch.load(params.pretrain_attn_model_path,
+                           map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
+            if all([k.startswith('module.') for k in reloaded.keys()]):
+                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
+
+            pretrain_model.load_state_dict(reloaded)
+            params.pretrain_model = pretrain_model
+            encoder = PretrainAttnTransModel(params, dico, is_encoder=True, with_output=True)
+        elif params.add_pretrain_path != '':
+            # 按照审稿论文实现
+            logger.info("Reloading add_pretrain_path from %s ..." % params.add_pretrain_path)
+            pretrain_model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+            reloaded = \
+                torch.load(params.add_pretrain_path,
+                           map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
+            if all([k.startswith('module.') for k in reloaded.keys()]):
+                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
+
+            pretrain_model.load_state_dict(reloaded)
+            params.pretrain_model = pretrain_model
+            encoder = AddPretrainTransModel(params, dico, is_encoder=True, with_output=True)
         else:
             # build
             encoder = TransformerModel(params, dico, is_encoder=True,
                                        with_output=True)  # TODO: only output when necessary - len(params.clm_steps + params.mlm_steps) > 0
         decoder = TransformerModel(params, dico, is_encoder=False, with_output=True)
+
+        # encoder端使用知识蒸馏
+        if params.encoder_KD != '':
+            logger.info("Reloading encoder KD from %s ..." % params.encoder_KD)
+            pretrain_model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+            reloaded = \
+                torch.load(params.encoder_KD,
+                           map_location=lambda storage, loc: storage.cuda(params.local_rank))[
+                    'model']
+            if all([k.startswith('module.') for k in reloaded.keys()]):
+                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
+
+            pretrain_model.load_state_dict(reloaded)
+            params.encoder_KD_model = pretrain_model.cuda()
+            params.KD_encoder = KD_encoder(params)
+        else:
+            params.encoder_KD_model = None
 
         # reload pretrained word embeddings
         if params.reload_emb != '':
@@ -201,7 +261,7 @@ def build_model(params, dico):
                 encoder.load_state_dict(enc_reload)
 
                 dec_reload = decoder.state_dict()
-                dec_reload.update(emb_reload)
+                dec_reload.update(only_emb_reload)
                 decoder.load_state_dict(dec_reload)
 
         # 使用xlm的embedding来初始化
@@ -224,7 +284,7 @@ def build_model(params, dico):
                             only_emb_reload[key] = value
 
                 dec_reload = decoder.state_dict()
-                dec_reload.update(emb_reload)
+                dec_reload.update(only_emb_reload)
                 decoder.load_state_dict(dec_reload)
 
         # reload a pretrained model
