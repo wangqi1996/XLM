@@ -826,6 +826,7 @@ class EncDecTrainer(Trainer):
         """
         assert lambda_coeff >= 0
         if lambda_coeff == 0:
+            exit(0)
             return
         params = self.params
         self.encoder.train()

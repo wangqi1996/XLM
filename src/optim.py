@@ -120,7 +120,7 @@ class AdamInverseSqrtWithWarmup(Adam):
 
         # then, decay prop. to the inverse square root of the update number
         self.exp_factor = exp_factor
-        self.decay_factor = warmup_end_lr * warmup_updates ** self.exp_factor
+        self.dlambda_mtecay_factor = warmup_end_lr * warmup_updates ** self.exp_factor
 
         # total number of updates
         for param_group in self.param_groups:

@@ -263,9 +263,9 @@ class TransformerModel(nn.Module):
 
         # model parameters
         self.dim = params.emb_dim  # 1024
-        self.hidden_dim = self.dim * 4  #
-        self.n_heads = params.n_heads  #
-        self.n_layers = params.n_layers
+        self.hidden_dim = self.dim * 4  # FFN的隐层大小
+        self.n_heads = params.n_heads # 8
+        self.n_layers = params.n_layers  # 6层
         self.dropout = params.dropout
         self.attention_dropout = params.attention_dropout
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
